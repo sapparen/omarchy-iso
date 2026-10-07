@@ -94,10 +94,27 @@ case "$KEYBOARD_LABEL" in
   *) echo "The VM harness cannot type credentials with keyboard: $KEYBOARD_LABEL" >&2; exit 1 ;;
 esac
 
-omarchy-pkg-add qemu-full edk2-ovmf socat imagemagick tesseract tesseract-data-eng
+if command -v omarchy-pkg-add >/dev/null 2>&1; then
+  omarchy-pkg-add qemu-full edk2-ovmf socat imagemagick tesseract tesseract-data-eng
+else
+  for command_name in qemu-system-x86_64 qemu-img socat magick tesseract jq ssh ssh-keygen python3; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      echo "Missing host dependency: $command_name" >&2
+      exit 1
+    fi
+  done
+fi
 
 OVMF_CODE="/usr/share/edk2/x64/OVMF_CODE.4m.fd"
 OVMF_VARS_TEMPLATE="/usr/share/edk2/x64/OVMF_VARS.4m.fd"
+if [[ ! -f $OVMF_CODE && -f /usr/share/OVMF/OVMF_CODE_4M.fd ]]; then
+  OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+  OVMF_VARS_TEMPLATE="/usr/share/OVMF/OVMF_VARS_4M.fd"
+fi
+if [[ ! -f $OVMF_CODE || ! -f $OVMF_VARS_TEMPLATE ]]; then
+  echo "Could not find usable OVMF firmware files." >&2
+  exit 1
+fi
 
 BASE_NAME="$(basename "$ISO" .iso)"
 if [[ $KEYBOARD_LABEL != "English (US)" ]]; then
@@ -213,7 +230,14 @@ trap cleanup EXIT
 
 start_vm() {
   local disk="$1" serial="$2"
+  local -a NETDEV_ARGS=(
+    -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22"
+  )
   shift 2
+
+  if [[ -n $HTTP_PID ]]; then
+    NETDEV_ARGS[1]+=",guestfwd=tcp:10.0.2.100:$HTTP_PORT-tcp:127.0.0.1:$HTTP_PORT"
+  fi
 
   # A viewer that resizes the guest display breaks the console driving: OCR
   # cannot read the shrunken font, and a resize during early boot can wedge
@@ -222,7 +246,7 @@ start_vm() {
 
   qemu-system-x86_64 \
     -cpu host -enable-kvm -machine q35,accel=kvm \
-    -smp "$(nproc)" \
+    -smp "${OMARCHY_ISO_CPUS:-$(nproc)}" \
     -m "$MEMORY" \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BASE_OVMF" \
@@ -232,7 +256,7 @@ start_vm() {
     -display none \
     -vnc 127.0.0.1:5 \
     -usb -device usb-tablet \
-    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22 \
+    "${NETDEV_ARGS[@]}" \
     -device virtio-net-pci,netdev=net0 \
     -qmp "unix:$QMP_SOCK,server,nowait" \
     -serial "file:$serial" \
@@ -939,9 +963,10 @@ unlock_luks() {
 
 # Log into a spare console TTY as the user and authorize the harness SSH key —
 # the same thing a person would do to give themselves remote access.
-bootstrap_ssh() {
-  log "Authorizing SSH access via console login"
-
+start_bootstrap_http_server() {
+  if [[ -n $HTTP_PID ]] && kill -0 "$HTTP_PID" 2>/dev/null; then
+    return 0
+  fi
   mkdir -p "$BASE_DIR/www"
   cat >"$BASE_DIR/www/bootstrap" <<EOF
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -953,6 +978,24 @@ EOF
 
   (cd "$BASE_DIR/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >/dev/null 2>&1) &
   HTTP_PID=$!
+
+  for _ in {1..50}; do
+    if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+      echo "Bootstrap HTTP server exited unexpectedly" >&2
+      return 1
+    fi
+    if curl --fail --silent "http://127.0.0.1:$HTTP_PORT/bootstrap" >/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Bootstrap HTTP server did not become ready" >&2
+  return 1
+}
+
+bootstrap_ssh() {
+  log "Authorizing SSH access via console login"
+  start_bootstrap_http_server
 
   # Type the login blind: a VNC viewer that resizes the framebuffer makes the
   # console font unreadable to OCR, and the real gate is SSH coming up anyway.
@@ -972,7 +1015,7 @@ EOF
     type_text "$GUEST_PASSWORD"
     press ret
     sleep 4
-    type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap -o /tmp/bs && bash /tmp/bs"
+    type_text "curl -fsS http://10.0.2.100:$HTTP_PORT/bootstrap -o /tmp/bs && bash /tmp/bs"
     capture_console "success-first-boot-05-bootstrap-command"
     press ret
 
@@ -1049,6 +1092,7 @@ install_phase() {
   log "Installing $(basename "$ISO") into a fresh VM (headless, driven via console)"
 
   [[ -f $SSH_KEY ]] || ssh-keygen -t ed25519 -N "" -q -C "omarchy-iso-test" -f "$SSH_KEY"
+  start_bootstrap_http_server
 
   rm -f "$BASE_DISK"
   qemu-img create -f qcow2 "$BASE_DISK" 40G >/dev/null

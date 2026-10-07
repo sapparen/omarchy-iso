@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SOURCE_DIR="${OMARCHY_REPO_DIR:-/home/jan/security-labs/omarchy-bounty-lab}"
+BASE_DIR="$REPO_DIR/test-runs/omarchy-4.0.4"
+SSH_PORT="${OMARCHY_AGENT_SSH_PORT:-2222}"
+
+if [[ ! -d $SOURCE_DIR/.git ]]; then
+  printf 'Omarchy checkout not found: %s\n' "$SOURCE_DIR" >&2
+  exit 1
+fi
+FULL_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+SHORT_COMMIT="${FULL_COMMIT:0:12}"
+TARGET="/home/omarchy/omarchy-source-$SHORT_COMMIT"
+SSH_OPTIONS=(-i "$BASE_DIR/id_ed25519" -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+git -C "$SOURCE_DIR" archive --format=tar "$FULL_COMMIT" | gzip -c |
+  ssh "${SSH_OPTIONS[@]}" omarchy@127.0.0.1 "mkdir -p '$TARGET' && tar -xzf - -C '$TARGET' && printf '%s\\n' '$FULL_COMMIT' >'$TARGET/.commit'"
+
+printf 'Synced commit %s to %s in the guest.\n' "$FULL_COMMIT" "$TARGET"

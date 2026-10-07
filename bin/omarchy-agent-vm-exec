@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+BASE_DIR="$REPO_DIR/test-runs/omarchy-4.0.4"
+SSH_PORT="${OMARCHY_AGENT_SSH_PORT:-2222}"
+
+if [[ $# -lt 1 ]]; then
+  printf 'Usage: %s COMMAND [ARG ...]\n' "$0" >&2
+  exit 2
+fi
+
+exec ssh -i "$BASE_DIR/id_ed25519" -p "$SSH_PORT" \
+  -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  omarchy@127.0.0.1 -- "$@"

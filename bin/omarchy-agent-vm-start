@@ -1,0 +1,60 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+BASE_DIR="$REPO_DIR/test-runs/omarchy-4.0.4"
+ACTIVE_FILE="$REPO_DIR/test-runs/agent-vm-current"
+SSH_PORT="${OMARCHY_AGENT_SSH_PORT:-2222}"
+MEMORY_MB="${OMARCHY_AGENT_VM_MEMORY:-6144}"
+CPUS="${OMARCHY_AGENT_VM_CPUS:-4}"
+
+if [[ ! -f $BASE_DIR/base.qcow2 || ! -f $BASE_DIR/OVMF_VARS.4m.fd || ! -f $BASE_DIR/id_ed25519 ]]; then
+  printf 'Base VM missing. First run omarchy-iso-test with --install-only.\n' >&2
+  exit 1
+fi
+if [[ -f $ACTIVE_FILE ]]; then
+  ACTIVE_DIR="$(<"$ACTIVE_FILE")"
+  if [[ -f $ACTIVE_DIR/qemu.pid ]] && kill -0 "$(<"$ACTIVE_DIR/qemu.pid")" 2>/dev/null; then
+    printf 'An agent VM is already running: %s\n' "$ACTIVE_DIR" >&2
+    exit 1
+  fi
+fi
+if [[ ! -w /dev/kvm ]]; then
+  printf 'KVM is not accessible to this user.\n' >&2
+  exit 1
+fi
+
+RUN_DIR="$REPO_DIR/test-runs/agent-vm-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RUN_DIR"
+qemu-img create -f qcow2 -F qcow2 -b "$BASE_DIR/base.qcow2" "$RUN_DIR/overlay.qcow2" >/dev/null
+cp "$BASE_DIR/OVMF_VARS.4m.fd" "$RUN_DIR/OVMF_VARS.4m.fd"
+
+OVMF_CODE="/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+if [[ ! -f $OVMF_CODE ]]; then
+  OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+fi
+if [[ ! -f $OVMF_CODE ]]; then
+  printf 'OVMF code firmware not found.\n' >&2
+  exit 1
+fi
+
+QMP_SOCK="/tmp/omarchy-agent-vm-$$.qmp"
+printf '%s\n' "$RUN_DIR" >"$ACTIVE_FILE"
+qemu-system-x86_64 \
+  -cpu host -enable-kvm -machine q35,accel=kvm \
+  -smp "$CPUS" -m "$MEMORY_MB" \
+  -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+  -drive "if=pflash,format=raw,file=$RUN_DIR/OVMF_VARS.4m.fd" \
+  -drive "file=$RUN_DIR/overlay.qcow2,format=qcow2,if=virtio" \
+  -device virtio-vga -display none -vnc 127.0.0.1:6 \
+  -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
+  -device virtio-net-pci,netdev=net0 \
+  -qmp "unix:$QMP_SOCK,server,nowait" \
+  -serial "file:$RUN_DIR/serial.log" \
+  -pidfile "$RUN_DIR/qemu.pid" -daemonize
+
+printf 'VM started. State: %s\n' "$RUN_DIR"
+printf 'SSH: ssh -i %s/id_ed25519 -p %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null omarchy@127.0.0.1\n' "$BASE_DIR" "$SSH_PORT"
+printf 'VNC (optional): 127.0.0.1:5906\n'
+printf 'The guest has no general network egress. Stop it with bin/omarchy-agent-vm-stop.\n'

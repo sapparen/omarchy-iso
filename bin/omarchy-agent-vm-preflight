@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Fail-closed, immediately-before-test metadata and isolation preflight.
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SOURCE_DIR="${OMARCHY_REPO_DIR:-/home/jan/security-labs/omarchy-bounty-lab}"
+BASE_DIR="$REPO_DIR/test-runs/omarchy-4.0.4"
+ACTIVE_FILE="$REPO_DIR/test-runs/agent-vm-current"
+SSH_PORT="${OMARCHY_AGENT_SSH_PORT:-2222}"
+POC="${1:-}"
+fail(){ printf 'PREFLIGHT_FAILED: %s\n' "$*" >&2; exit 1; }
+[[ $SSH_PORT =~ ^[0-9]{1,5}$ ]] && ((10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535)) || fail 'SSH port is invalid'
+[[ -f $ACTIVE_FILE ]] || fail 'no active run pointer'
+RUN_DIR="$(<"$ACTIVE_FILE")"
+[[ -d $RUN_DIR && -f $RUN_DIR/overlay.qcow2 && -f $RUN_DIR/qemu.pid ]] || fail 'run directory, overlay, or pid missing'
+case "$RUN_DIR" in "$REPO_DIR"/test-runs/agent-vm-*) ;; *) fail 'active run path is outside the dedicated agent VM run directory' ;; esac
+PID="$(<"$RUN_DIR/qemu.pid")"
+[[ $PID =~ ^[0-9]+$ ]] || fail 'recorded QEMU PID is invalid'
+kill -0 "$PID" 2>/dev/null || fail 'recorded QEMU process not running'
+[[ -r /dev/kvm && -w /dev/kvm ]] || fail '/dev/kvm unavailable'
+QEMU_BIN="$(command -v qemu-system-x86_64)" || fail 'QEMU binary missing'
+QEMU_VERSION="$("$QEMU_BIN" --version | head -n1)"
+[[ -r /proc/$PID/cmdline && -e /proc/$PID/exe ]] || fail 'QEMU process metadata unavailable'
+python3 - "$PID" "$RUN_DIR" "$QEMU_BIN" "$SSH_PORT" "$BASE_DIR/base.qcow2" <<'PY' || exit 1
+import json, os, re, subprocess, sys
+pid, run_dir, qemu_bin, ssh_port, base = sys.argv[1:]
+fail = lambda msg: (print(f"PREFLIGHT_FAILED: {msg}", file=sys.stderr), sys.exit(1))
+try:
+    argv = open(f"/proc/{pid}/cmdline", "rb").read().rstrip(b"\0").decode().split("\0")
+    actual_exe = os.path.realpath(f"/proc/{pid}/exe")
+except Exception as exc:
+    fail(f"cannot read QEMU process identity: {exc}")
+if os.path.basename(argv[0]) != "qemu-system-x86_64" or actual_exe != os.path.realpath(qemu_bin):
+    fail("recorded PID is not the expected QEMU executable")
+options, flags = {}, set()
+i = 1
+flag_set = {"-enable-kvm", "-daemonize"}
+value_set = {"-cpu", "-machine", "-smp", "-m", "-drive", "-device", "-display", "-vnc", "-netdev", "-qmp", "-serial", "-pidfile"}
+while i < len(argv):
+    arg = argv[i]
+    if arg in flag_set:
+        if arg in flags: fail(f"duplicate QEMU flag {arg}")
+        flags.add(arg); i += 1; continue
+    if arg not in value_set or i + 1 >= len(argv):
+        fail(f"unexpected QEMU argument {arg!r}; refusing unreviewed device/network/mount options")
+    options.setdefault(arg, []).append(argv[i + 1])
+    i += 2
+if flags != flag_set: fail("QEMU must use exactly KVM and daemonize flags")
+for key in value_set - {"-drive", "-device"}:
+    if len(options.get(key, [])) != 1: fail(f"expected exactly one {key}")
+expected_single = {
+    "-cpu": "host",
+    "-machine": "q35,accel=kvm",
+    "-display": "none",
+    "-vnc": "127.0.0.1:6",
+    "-netdev": f"user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+    "-serial": f"file:{run_dir}/serial.log",
+    "-pidfile": f"{run_dir}/qemu.pid",
+}
+for key, expected in expected_single.items():
+    if options[key][0] != expected: fail(f"{key} differs from the isolated VM profile")
+if not re.fullmatch(r"[1-9][0-9]*", options["-smp"][0]) or not re.fullmatch(r"[1-9][0-9]*", options["-m"][0]):
+    fail("invalid CPU or memory value")
+if not re.fullmatch(r"unix:/tmp/omarchy-agent-vm-[0-9]+\.qmp,server,nowait", options["-qmp"][0]):
+    fail("QMP endpoint is not the expected local Unix socket")
+expected_devices = ["virtio-vga", "virtio-net-pci,netdev=net0"]
+if options.get("-device") != expected_devices: fail("unexpected or additional QEMU device")
+expected_drives = [
+    f"if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+    f"if=pflash,format=raw,file={run_dir}/OVMF_VARS.4m.fd",
+    f"file={run_dir}/overlay.qcow2,format=qcow2,if=virtio",
+]
+# Ubuntu packages the read-only firmware at either of these two fixed paths.
+expected_drives[0] = options["-drive"][0]
+if expected_drives[0] not in {
+    "if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+    "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+}:
+    fail("firmware drive is not one of the known read-only OVMF images")
+if options.get("-drive") != expected_drives: fail("disk set differs from firmware plus isolated overlay; host disks are forbidden")
+try:
+    info = json.loads(subprocess.check_output(["qemu-img", "info", "--force-share", "--output=json", f"{run_dir}/overlay.qcow2"], text=True))
+except Exception as exc:
+    fail(f"cannot inspect overlay backing metadata: {exc}")
+if info.get("format") != "qcow2" or os.path.realpath(info.get("backing-filename", "")) != os.path.realpath(base):
+    fail("overlay is not a fresh qcow2 backed by the approved immutable base image")
+PY
+[[ -d $SOURCE_DIR/.git ]] || fail 'source checkout missing'
+BRANCH="$(git -C "$SOURCE_DIR" branch --show-current)"
+COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+[[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || fail 'source commit is not a full Git SHA'
+[[ $BRANCH == quattro ]] || fail "source branch is $BRANCH, expected quattro"
+[[ -z $(git -C "$SOURCE_DIR" status --porcelain) ]] || fail 'source checkout is dirty'
+SOURCE_GUEST="/home/omarchy/omarchy-source-${COMMIT:0:12}"
+SSH=(ssh -F /dev/null -i "$BASE_DIR/id_ed25519" -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -o ClearAllForwardings=yes omarchy@127.0.0.1)
+GUEST="$("${SSH[@]}" "printf 'USER=%s UID=%s\\n' \"\$(id -un)\" \"\$(id -u)\"; pacman -Q omarchy; printf 'SOURCE=%s COMMIT=%s\\n' '$SOURCE_GUEST' \"\$(cat '$SOURCE_GUEST/.commit' 2>/dev/null || true)\"" )" || fail 'SSH readiness check failed'
+grep -q '^USER=omarchy UID=1000$' <<<"$GUEST" || fail 'guest username/UID mismatch'
+grep -Eq '^omarchy [^[:space:]]+$' <<<"$GUEST" || fail 'installed Omarchy version unavailable'
+grep -Fqx "SOURCE=$SOURCE_GUEST COMMIT=$COMMIT" <<<"$GUEST" || fail 'guest source path/commit does not match clean host checkout'
+POC_SHA='NOT_PROVIDED'
+if [[ -n $POC ]]; then [[ -f $POC ]] || fail 'PoC file not found'; POC_SHA="$(sha256sum "$POC" | cut -d' ' -f1)"; fi
+python3 - "$RUN_DIR/research-run.json" "$QEMU_VERSION" "$RUN_DIR/overlay.qcow2" "$PID" "$SSH_PORT" "$COMMIT" "$GUEST" "$POC_SHA" <<'PY'
+import json,sys,datetime,platform,os
+path,qemu,overlay,pid,port,commit,guest,poc=sys.argv[1:]
+try: data=json.load(open(path))
+except Exception: data={}
+data.update({"preflight":"PASS","host":{"hostname":platform.node(),"platform":platform.platform()},"qemu_version":qemu,"qemu_pid":int(pid),"overlay":overlay,"network_isolation":"Strict QEMU argv allowlist passed: user net restrict=on, loopback SSH forward only, no additional devices/drives/mounts; verified from /proc PID argv and executable","ssh_readiness":"PASS","ssh_forward":"127.0.0.1:"+port,"guest_identity_and_version":guest,"source_commit":commit,"poc_sha256":poc,"test_started_utc":datetime.datetime.now(datetime.timezone.utc).isoformat()})
+with open(path,'w') as f: json.dump(data,f,indent=2); f.write('\n')
+os.chmod(path,0o600)
+PY
+printf 'PREFLIGHT_OK: run=%s commit=%s poc_sha256=%s\n' "$RUN_DIR" "$COMMIT" "$POC_SHA"
